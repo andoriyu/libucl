@@ -170,10 +170,15 @@ private:
 	std::unique_ptr<ucl_object_t, ucl_deleter> obj;
 
 public:
-	typedef struct {
+	struct macro_handler_s {
 		ucl_macro_handler         handler;
 		ucl_context_macro_handler ctx_handler;
-	} macro_handler_s;
+	};
+
+	struct macro_userdata_s {
+		ucl_parser    *parser;
+		void          *userdata;
+	};
 
 	class const_iterator {
 	private:
@@ -191,7 +196,7 @@ public:
 			it = std::shared_ptr<void>(ucl_object_iterate_new (obj.obj.get()),
 				ucl_iter_deleter());
 			cur.reset (new Ucl(ucl_object_iterate_safe (it.get(), true)));
-			if (cur->type() == UCL_NULL) {
+			if (!cur->obj) {
 				it.reset ();
 				cur.reset ();
 			}
@@ -225,7 +230,7 @@ public:
 				cur.reset (new Ucl(ucl_object_iterate_safe (it.get(), true)));
 			}
 
-			if (cur && cur->type() == UCL_NULL) {
+			if (cur && !cur->obj) {
 				it.reset ();
 				cur.reset ();
 			}
@@ -337,7 +342,7 @@ public:
 		return UCL_NULL;
 	}
 
-	const std::string key () const {
+	std::string key () const {
 		std::string res;
 
 		if (obj->key) {
@@ -380,7 +385,7 @@ public:
 		return default_val;
 	}
 
-	const std::string string_value (const std::string& default_val = "") const
+	std::string string_value (const std::string& default_val = "") const
 	{
 		const char* res = nullptr;
 
@@ -391,7 +396,7 @@ public:
 		return default_val;
 	}
 
-	const size_t size () const
+	size_t size () const
 	{
 		if (type () == UCL_ARRAY) {
 			return ucl_array_size (obj.get());
@@ -400,7 +405,7 @@ public:
 		return 0;
 	}
 
-	const Ucl at (size_t i) const
+	Ucl at (size_t i) const
 	{
 		if (type () == UCL_ARRAY) {
 			return Ucl (ucl_array_find_index (obj.get(), i));
@@ -409,7 +414,7 @@ public:
 		return Ucl (nullptr);
 	}
 
-	const Ucl lookup (const std::string &key) const
+	Ucl lookup (const std::string &key) const
 	{
 		if (type () == UCL_OBJECT) {
 			return Ucl (ucl_object_lookup_len (obj.get(),
@@ -419,12 +424,12 @@ public:
 		return Ucl (nullptr);
 	}
 
-	inline const Ucl operator[] (size_t i) const
+	inline Ucl operator[] (size_t i) const
 	{
 		return at(i);
 	}
 
-	inline const Ucl operator[](const std::string &key) const
+	inline Ucl operator[](const std::string &key) const
 	{
 		return lookup(key);
 	}
@@ -460,6 +465,7 @@ public:
 		return parse ( in, vars, emptyVector, err, duplicate_strategy );
 	}
 
+	//Macro handler will receive a macro_userdata_s as void *ud
 	static Ucl parse (const std::string &in,
 			std::vector< std::tuple< std::string /*name*/, macro_handler_s, void * /*userdata*/ > > &macros,
 			std::string &err, enum ucl_duplicate_strategy duplicate_strategy = UCL_DUPLICATE_APPEND)
@@ -467,29 +473,42 @@ public:
 		return parse (in, std::map<std::string, std::string>(), macros, err, duplicate_strategy);
 	}
 
+	//Macro handler will receive a macro_userdata_s as void *ud
 	static Ucl parse (const std::string &in, const std::map<std::string, std::string> &vars,
 			std::vector< std::tuple< std::string /*name*/, macro_handler_s, void * /*userdata*/ > > &macros,
 			std::string &err, enum ucl_duplicate_strategy duplicate_strategy = UCL_DUPLICATE_APPEND)
 	{
-		auto config_func = [&vars, &macros] (ucl_parser *parser) {
+		//Preserve macro_userdata_s memory for later use in parse_with_strategy_function()
+		std::vector<macro_userdata_s> userdata_list;
+		userdata_list.reserve (macros.size());
+		auto config_func = [&userdata_list, &vars, &macros] (ucl_parser *parser) {
 			for (const auto & item : vars) {
 				ucl_parser_register_variable (parser, item.first.c_str (), item.second.c_str ());
 			}
-			for (const auto & macro : macros) {
-				if( std::get<1>(macro).handler != NULL ) {
-					ucl_parser_register_macro (parser, std::get<0>(macro).c_str(), std::get<1>(macro).handler,
-								((std::get<2>(macro) == NULL) ? reinterpret_cast<void*>(parser) : std::get<2>(macro)) );
+			for (auto & macro : macros) {
+				userdata_list.push_back ({parser, std::get<2>(macro)});
+				if (std::get<1>(macro).handler != NULL) {
+					ucl_parser_register_macro (parser,
+								std::get<0>(macro).c_str(),
+								std::get<1>(macro).handler,
+								reinterpret_cast<void*>(&userdata_list.back()));
 				}
-				else if( std::get<1>(macro).ctx_handler != NULL ) {
-					ucl_parser_register_context_macro (parser, std::get<0>(macro).c_str(), std::get<1>(macro).ctx_handler,
-									((std::get<2>(macro) == NULL) ? reinterpret_cast<void*>(parser) : std::get<2>(macro)) );
+				else if (std::get<1>(macro).ctx_handler != NULL) {
+					ucl_parser_register_context_macro (parser,
+									std::get<0>(macro).c_str(),
+									std::get<1>(macro).ctx_handler,
+									reinterpret_cast<void*>(&userdata_list.back()));
 				}
 			}
 		};
 
 		auto parse_func = [&in, &duplicate_strategy] (struct ucl_parser *parser) -> bool {
-			return ucl_parser_add_chunk_full (parser, (unsigned char *) in.data (), in.size (),
-							(unsigned int)ucl_parser_get_default_priority (parser), duplicate_strategy, UCL_PARSE_UCL);
+			return ucl_parser_add_chunk_full (parser,
+							(unsigned char *) in.data (),
+							in.size (),
+							(unsigned int)ucl_parser_get_default_priority (parser),
+							duplicate_strategy,
+							UCL_PARSE_UCL);
 		};
 
 		return parse_with_strategy_function (config_func, parse_func, err);
@@ -502,29 +521,40 @@ public:
 		return parse ( in, replacer, emptyVector, err, duplicate_strategy );
 	}
 
+	//Macro handler will receive a macro_userdata_s as void *ud
 	static Ucl parse (const std::string &in, const variable_replacer &replacer,
 			std::vector< std::tuple< std::string /*name*/, macro_handler_s, void * /*userdata*/ > > &macros,
 			std::string &err, enum ucl_duplicate_strategy duplicate_strategy = UCL_DUPLICATE_APPEND)
 	{
-		auto config_func = [&replacer, &macros] (ucl_parser *parser) {
+		//Preserve macro_userdata_s memory for later use in parse_with_strategy_function()
+		std::vector<macro_userdata_s> userdata_list;
+		userdata_list.reserve (macros.size());
+		auto config_func = [&userdata_list, &replacer, &macros] (ucl_parser *parser) {
 			ucl_parser_set_variables_handler (parser, ucl_variable_replacer, &const_cast<variable_replacer &>(replacer));
-			for (const auto & macro : macros) {
-				if( std::get<1>(macro).handler != NULL )
-				{
-					ucl_parser_register_macro (parser, std::get<0>(macro).c_str(), std::get<1>(macro).handler,
-								((std::get<2>(macro) == NULL) ? reinterpret_cast<void*>(parser) : std::get<2>(macro)) );
+			for (auto & macro : macros) {
+				userdata_list.push_back ({parser, std::get<2>(macro)});
+				if (std::get<1>(macro).handler != NULL) {
+					ucl_parser_register_macro (parser,
+								std::get<0>(macro).c_str(),
+								std::get<1>(macro).handler,
+								reinterpret_cast<void*>(&userdata_list.back()));
 				}
-				else if( std::get<1>(macro).ctx_handler != NULL )
-				{
-					ucl_parser_register_context_macro (parser, std::get<0>(macro).c_str(), std::get<1>(macro).ctx_handler,
-									((std::get<2>(macro) == NULL) ? reinterpret_cast<void*>(parser) : std::get<2>(macro)) );
+				else if (std::get<1>(macro).ctx_handler != NULL) {
+					ucl_parser_register_context_macro (parser,
+									std::get<0>(macro).c_str(),
+									std::get<1>(macro).ctx_handler,
+									reinterpret_cast<void*>(&userdata_list.back()));
 				}
 			}
 		};
 
 		auto parse_func = [&in, &duplicate_strategy] (struct ucl_parser *parser) -> bool {
-			return ucl_parser_add_chunk_full (parser, (unsigned char *) in.data (), in.size (), 
-							(unsigned int)ucl_parser_get_default_priority (parser), duplicate_strategy, UCL_PARSE_UCL);
+			return ucl_parser_add_chunk_full (parser,
+							(unsigned char *) in.data (),
+							in.size (),
+							(unsigned int)ucl_parser_get_default_priority (parser),
+							duplicate_strategy,
+							UCL_PARSE_UCL);
 		};
 
 		return parse_with_strategy_function (config_func, parse_func, err);
@@ -544,6 +574,7 @@ public:
 		return parse (std::string (in), vars, err);
 	}
 
+	//Macro handler will receive a macro_userdata_s as void *ud
 	static Ucl parse (const char *in,
 			std::vector< std::tuple< std::string /*name*/, macro_handler_s, void * /*userdata*/ > > &macros,
 			std::string &err, enum ucl_duplicate_strategy duplicate_strategy = UCL_DUPLICATE_APPEND)
@@ -551,6 +582,7 @@ public:
 		return parse (in, std::map<std::string, std::string>(), macros, err, duplicate_strategy);
 	}
 
+	//Macro handler will receive a macro_userdata_s as void *ud
 	static Ucl parse (const char *in, const std::map<std::string, std::string> &vars,
 			std::vector< std::tuple< std::string /*name*/, macro_handler_s, void * /*userdata*/ > > &macros,
 			std::string &err, enum ucl_duplicate_strategy duplicate_strategy = UCL_DUPLICATE_APPEND)
@@ -572,6 +604,7 @@ public:
 		return parse (std::string(in), replacer, err, duplicate_strategy);
 	}
 
+	//Macro handler will receive a macro_userdata_s as void *ud
 	static Ucl parse (const char *in, const variable_replacer &replacer,
 			std::vector< std::tuple< std::string /*name*/, macro_handler_s, void * /*userdata*/ > > &macros,
 			std::string &err, enum ucl_duplicate_strategy duplicate_strategy = UCL_DUPLICATE_APPEND)
@@ -650,7 +683,7 @@ public:
 
 		std::vector<std::string> result;
 		std::move (vars.begin (), vars.end (), std::back_inserter (result));
-		return std::move (result);
+		return result;
 	}
 
 	Ucl& operator= (Ucl rhs)

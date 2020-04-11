@@ -105,6 +105,7 @@ typedef enum ucl_error {
 	UCL_EIO, /**< IO error occurred during parsing */
 	UCL_ESTATE, /**< Invalid state machine state */
 	UCL_ENESTED, /**< Input has too many recursion levels */
+	UCL_EUNPAIRED, /**< Input has too many recursion levels */
 	UCL_EMACRO, /**< Error processing a macro */
 	UCL_EINTERNAL, /**< Internal unclassified error */
 	UCL_ESSL, /**< SSL error */
@@ -177,7 +178,8 @@ typedef enum ucl_string_flags {
 } ucl_string_flags_t;
 
 /**
- * Basic flags for an object
+ * Basic flags for an object (can use up to 12 bits as higher 4 bits are used
+ * for priorities)
  */
 typedef enum ucl_object_flags {
 	UCL_OBJECT_ALLOCATED_KEY = (1 << 0), /**< An object has key allocated internally */
@@ -187,7 +189,8 @@ typedef enum ucl_object_flags {
 	UCL_OBJECT_MULTILINE = (1 << 4), /**< String should be displayed as multiline string */
 	UCL_OBJECT_MULTIVALUE = (1 << 5), /**< Object is a key with multiple values */
 	UCL_OBJECT_INHERITED = (1 << 6), /**< Object has been inherited from another */
-	UCL_OBJECT_BINARY = (1 << 7) /**< Object contains raw binary data */
+	UCL_OBJECT_BINARY = (1 << 7), /**< Object contains raw binary data */
+	UCL_OBJECT_SQUOTED = (1 << 8) /**< Object has been enclosed in single quotes */
 } ucl_object_flags_t;
 
 /**
@@ -466,8 +469,9 @@ UCL_EXTERN bool ucl_object_insert_key_merged (ucl_object_t *top, ucl_object_t *e
  * Reserve space in ucl array or object for `elt` elements
  * @param obj object to reserve
  * @param reserved size to reserve in an object
+ * @return 0 on success, -1 on failure (i.e. ENOMEM)
  */
-UCL_EXTERN void ucl_object_reserve (ucl_object_t *obj, size_t reserved);
+UCL_EXTERN bool ucl_object_reserve (ucl_object_t *obj, size_t reserved);
 
 /**
  * Append an element to the end of array object
@@ -796,6 +800,19 @@ UCL_EXTERN int ucl_object_compare_qsort (const ucl_object_t **o1,
 UCL_EXTERN void ucl_object_array_sort (ucl_object_t *ar,
 		int (*cmp)(const ucl_object_t **o1, const ucl_object_t **o2));
 
+enum ucl_object_keys_sort_flags {
+	UCL_SORT_KEYS_DEFAULT = 0,
+	UCL_SORT_KEYS_ICASE = (1u << 0u),
+	UCL_SORT_KEYS_RECURSIVE = (1u << 1u),
+};
+/***
+ * Sorts keys in object in place
+ * @param obj
+ * @param how
+ */
+UCL_EXTERN void ucl_object_sort_keys (ucl_object_t *obj,
+		enum ucl_object_keys_sort_flags how);
+
 /**
  * Get the priority for specific UCL object
  * @param obj any ucl object
@@ -822,11 +839,14 @@ typedef void* ucl_object_iter_t;
  * @param iter opaque iterator, must be set to NULL on the first call:
  * ucl_object_iter_t it = NULL;
  * while ((cur = ucl_iterate_object (obj, &it)) != NULL) ...
+ * @param ep pointer record exception (such as ENOMEM), could be NULL
  * @return the next object or NULL
  */
-UCL_EXTERN const ucl_object_t* ucl_object_iterate (const ucl_object_t *obj,
-		ucl_object_iter_t *iter, bool expand_values);
+UCL_EXTERN const ucl_object_t* ucl_object_iterate_with_error (const ucl_object_t *obj,
+		ucl_object_iter_t *iter, bool expand_values, int *ep);
+
 #define ucl_iterate_object ucl_object_iterate
+#define ucl_object_iterate(ob, it, ev) ucl_object_iterate_with_error((ob), (it), (ev), NULL)
 
 /**
  * Create new safe iterator for the specified object
@@ -835,6 +855,15 @@ UCL_EXTERN const ucl_object_t* ucl_object_iterate (const ucl_object_t *obj,
  */
 UCL_EXTERN ucl_object_iter_t ucl_object_iterate_new (const ucl_object_t *obj)
 	UCL_WARN_UNUSED_RESULT;
+/**
+ * Check safe iterator object after performing some operations on it
+ * (such as ucl_object_iterate_safe()) to see if operation has encountered
+ * fatal exception while performing that operation (e.g. ENOMEM).
+ * @param iter opaque iterator
+ * @return true if exception has occured, false otherwise
+ */
+UCL_EXTERN bool ucl_object_iter_chk_excpn(ucl_object_iter_t *it);
+
 /**
  * Reset initialized iterator to a new object
  * @param obj new object to iterate
@@ -948,8 +977,9 @@ UCL_EXTERN int ucl_parser_get_default_priority (struct ucl_parser *parser);
  * @param macro macro name (without leading dot)
  * @param handler handler (it is called immediately after macro is parsed)
  * @param ud opaque user data for a handler
+ * @return true on success, false on failure (i.e. ENOMEM)
  */
-UCL_EXTERN void ucl_parser_register_macro (struct ucl_parser *parser,
+UCL_EXTERN bool ucl_parser_register_macro (struct ucl_parser *parser,
 		const char *macro,
 		ucl_macro_handler handler, void* ud);
 
@@ -959,8 +989,9 @@ UCL_EXTERN void ucl_parser_register_macro (struct ucl_parser *parser,
  * @param macro macro name (without leading dot)
  * @param handler handler (it is called immediately after macro is parsed)
  * @param ud opaque user data for a handler
+ * @return true on success, false on failure (i.e. ENOMEM)
  */
-UCL_EXTERN void ucl_parser_register_context_macro (struct ucl_parser *parser,
+UCL_EXTERN bool ucl_parser_register_context_macro (struct ucl_parser *parser,
 		const char *macro,
 		ucl_context_macro_handler handler,
 		void* ud);
@@ -1276,6 +1307,76 @@ UCL_EXTERN bool ucl_parser_pubkey_add (struct ucl_parser *parser,
 UCL_EXTERN bool ucl_parser_set_filevars (struct ucl_parser *parser, const char *filename,
 		bool need_expand);
 
+/**
+ * Returns current file for the parser
+ * @param parser parser object
+ * @return current file or NULL if parsing memory
+ */
+UCL_EXTERN const char *ucl_parser_get_cur_file (struct ucl_parser *parser);
+
+/**
+ * Defines special handler for certain types of data (identified by magic)
+ */
+typedef bool (*ucl_parser_special_handler_t) (struct ucl_parser *parser,
+		const unsigned char *source, size_t source_len,
+		unsigned char **destination, size_t *dest_len,
+		void *user_data);
+
+/**
+ * Special handler flags
+ */
+enum ucl_special_handler_flags {
+	UCL_SPECIAL_HANDLER_DEFAULT = 0,
+	UCL_SPECIAL_HANDLER_PREPROCESS_ALL = (1u << 0),
+};
+
+/**
+ * Special handler structure
+ */
+struct ucl_parser_special_handler {
+	const unsigned char *magic;
+	size_t magic_len;
+	enum ucl_special_handler_flags flags;
+	ucl_parser_special_handler_t handler;
+	void (*free_function) (unsigned char *data, size_t len, void *user_data);
+	void *user_data;
+	struct ucl_parser_special_handler *next; /* Used internally */
+};
+
+/**
+ * Add special handler for a parser, handles special sequences identified by magic
+ * @param parser parser structure
+ * @param handler handler structure
+ */
+UCL_EXTERN void ucl_parser_add_special_handler (struct ucl_parser *parser,
+		struct ucl_parser_special_handler *handler);
+
+/**
+ * Handler for include traces:
+ * @param parser parser object
+ * @param parent where include is done from
+ * @param args arguments to an include
+ * @param path path of the include
+ * @param pathlen length of the path
+ * @param user_data opaque userdata
+ */
+typedef void (ucl_include_trace_func_t) (struct ucl_parser *parser,
+		const ucl_object_t *parent,
+		const ucl_object_t *args,
+		const char *path,
+		size_t pathlen,
+		void *user_data);
+
+/**
+ * Register trace function for an include handler
+ * @param parser parser object
+ * @param func function to trace includes
+ * @param user_data opaque data
+ */
+UCL_EXTERN void ucl_parser_set_include_tracer (struct ucl_parser *parser,
+											   ucl_include_trace_func_t func,
+											   void *user_data);
+
 /** @} */
 
 /**
@@ -1545,5 +1646,8 @@ UCL_EXTERN bool ucl_object_validate_root_ext (const ucl_object_t *schema,
 #define ucl_obj_unref ucl_object_unref
 #define ucl_obj_ref ucl_object_ref
 #define ucl_obj_free ucl_object_free
+
+#define UCL_PRIORITY_MIN 0
+#define UCL_PRIORITY_MAX 15
 
 #endif /* UCL_H_ */
